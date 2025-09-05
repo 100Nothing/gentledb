@@ -1,0 +1,53 @@
+{
+  "name": "gentledb",
+  "version": "1.0.0",
+  "description": "A safe JSON database wrapper built on top of LowDB.",
+  "keywords": [
+    "gentledb",
+    "lowdb",
+    "json-database",
+    "file-database",
+    "embedded-db",
+    "localdb",
+    "nodejs",
+    "debounce",
+    "file-locking",
+    "watcher"
+  ],
+  "author": "100Nothing",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "src/GentleDB.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./src/GentleDB.js",
+      "import": "./src/GentleDB.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "test",
+    "package.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "bugs": {
+    "url": "https://github.com/100Nothing/gentledb/issues"
+  },
+  "homepage": "https://github.com/100Nothing/gentledb#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/100Nothing/gentledb.git"
+  },
+  "scripts": {
+    "test": "node ./test/run-tests.cjs",
+    "example:basic": "node src/examples/basic.cjs.js",
+    "example:events": "node src/examples/events.cjs.js",
+    "example:find": "node src/examples/findMatches.cjs.js"
+  },
+  "dependencies": {
+    "lowdb": "^7.0.1"
+  }
+}
