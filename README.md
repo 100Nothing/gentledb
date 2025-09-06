@@ -1,3 +1,5 @@
+[version: 1.0.1](https://github.com/100Nothing/gentledb/releases/tag/v1.0.1)
+
 # GentleDB
 
 A small convenience wrapper around lowdb providing debounced read/write, file-watching, a tiny event system, and safe on-disk locking.
