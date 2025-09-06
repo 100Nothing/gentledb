@@ -7,27 +7,14 @@ const fsp = fs.promises;
 const path = require('path');
 const { EventEmitter } = require('events');
 
-// Stable JSON.stringify helper
-function stableStringify(v) {
-    if (v === undefined) return 'undefined';
-    if (v === null) return 'null';
-    if (typeof v === 'string') return JSON.stringify(v);
-    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-    if (Array.isArray(v)) {
-        return '[' + v.map(stableStringify).join(',') + ']';
-    }
-    if (typeof v === 'object') {
-        const keys = Object.keys(v).sort();
-        return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(v[k])).join(',') + '}';
-    }
-    // Fallback for other types
-    try { return JSON.stringify(v); } catch (e) { return String(v); }
-}
-
 class GentleDB {
+    // track instances for exit cleanup
+    static _instances = new Set();
+    static _exitHandlerRegistered = false;
+
     constructor(adapterOrPath, opts = {}) {
-        // PUBLIC OPTIONS (defaults)
-        this.opts = Object.assign({
+        // Normalize options once
+        const defaultOpts = {
             debounceWriteMs: 100,
             debounceReadMs: 50,
             defaultData: {},
@@ -37,18 +24,30 @@ class GentleDB {
             lockTimeoutMs: 5000,
             lockStaleMs: 10000,
             watchDebounceMs: 75
-        }, opts);
+        };
+        this.opts = Object.assign({}, defaultOpts, opts);
+
+        // Normalize numeric options (clamp / coerce)
+        this._debounceWriteMs = Math.max(0, Number(this.opts.debounceWriteMs) || 0);
+        this._debounceReadMs = Math.max(0, Number(this.opts.debounceReadMs) || 0);
+        this._lockRetryDelayMs = Math.max(10, Number(this.opts.lockRetryDelayMs) || 50);
+        this._lockTimeoutMs = Math.max(0, Number(this.opts.lockTimeoutMs) || 5000);
+        this._lockStaleMs = Math.max(1000, Number(this.opts.lockStaleMs) || 10000);
+        this._watchDebounceMs = Math.max(10, Number(this.opts.watchDebounceMs) || 75);
+        this._maxMatchesDefault = Math.max(1, Math.floor(this.opts.maxMatches || 1000));
+        this.opts.caseSensitive = Boolean(this.opts.caseSensitive);
 
         // Event emitter
         this._ee = new EventEmitter();
-        // internal lowdb references (populated in _initPromise)
+
+        // lowdb related (populated in _initPromise)
         this._low = null;
         this._adapter = null;
         this._filePath = null;
         this._lockPath = null;
         this._heldLockHandle = null;
 
-        // Debounce/serialization state
+        // Debounce / serialization state
         this._writeTimer = null;
         this._readTimer = null;
         this._pendingWrite = null;
@@ -57,69 +56,77 @@ class GentleDB {
 
         // Watcher flags
         this._watcher = null;
+        this._usingWatchFile = false;
         this._suppressWatchEvents = false;
         this._isWriting = false;
         this._lastOnDiskSnapshot = null;
 
-        // Expose an init promise that resolves once lowdb is loaded and an initial read/write
-        // (this mirrors existing code patterns using this._initPromise)
+        // register instance and exit handler once
+        GentleDB._instances.add(this);
+        if (!GentleDB._exitHandlerRegistered) {
+            GentleDB._exitHandlerRegistered = true;
+            const cleanup = () => {
+                for (const inst of GentleDB._instances) {
+                    try {
+                        if (inst && inst._heldLockHandle) {
+                            // best-effort synchronous unlink - avoid async work on exit
+                            try { fs.unlinkSync(inst._lockPath); } catch (e) { /* ignore */ }
+                        }
+                    } catch (e) { /* ignore */ }
+                }
+            };
+            process.on('exit', cleanup);
+            // attempt best-effort on signals
+            process.on('SIGINT', () => { cleanup(); process.exit(130); });
+            process.on('SIGTERM', () => { cleanup(); process.exit(143); });
+        }
+
+        // Expose init promise resolving once lowdb ready
         this._initPromise = (async () => {
-            // Resolve lowdb and JSONFile constructor, supports require() or dynamic import
             const { Low, JSONFile } = await GentleDB._loadLowdbModule();
 
-            // Build adapter
             let adapter = adapterOrPath;
             let filePathCandidate = null;
 
             if (typeof adapterOrPath === 'string') {
-                // path string
                 filePathCandidate = path.resolve(String(adapterOrPath));
-
-                // Ensure directory exists
+                // ensure directory exists
                 try {
-                    const dir = path.dirname(filePathCandidate);
-                    await fsp.mkdir(dir, { recursive: true });
+                    await fsp.mkdir(path.dirname(filePathCandidate), { recursive: true });
                 } catch (err) {
                     throw new Error(`GentleDB: failed to ensure directory exists from path ${filePathCandidate}: ${err && err.message ? err.message : String(err)}`);
                 }
-
-                // Create adapter
+                if (!JSONFile) {
+                    throw new Error('GentleDB: lowdb JSONFile adapter not found for string path usage.');
+                }
                 adapter = new JSONFile(filePathCandidate);
                 this._filePath = filePathCandidate;
-            } else if (adapterOrPath && typeof adapterOrPath === 'object' && adapterOrPath !== null) {
-                // adapter instance - try to locate a path property (best-effort)
+            } else if (adapterOrPath && typeof adapterOrPath === 'object') {
+                // best-effort discover filename
                 try {
-                    this._filePath = adapter.filename || adapter.filePath || adapter.path || adapter.file || null;
+                    this._filePath = adapterOrPath.filename || adapterOrPath.filePath || adapterOrPath.path || adapterOrPath.file || null;
                 } catch (e) {
                     this._filePath = null;
-                    // Let lowdb fail if it can't find a path and throw
                 }
             } else {
                 throw new Error('GentleDB: adapterOrPath must be a path string or a lowdb adapter instance.');
             }
 
-            // Store file path info (preserve any adapter-derived path; prefer explicit string path)
             this._filePath ??= filePathCandidate ? filePathCandidate : null;
             this._lockPath = this._filePath ? `${this._filePath}.lock` : null;
 
-            // Save adapter and low instance
             this._adapter = adapter;
             try {
                 this._low = new Low(this._adapter, this.opts.defaultData || {});
             } catch (err) {
-                // If the adapter shape is unexpected, surface a helpful error
-                throw new Error(`GentleDB: failed to construct Low(adapter) — adapter provided must be a lowdb adapter instance or a path string. Underlying error: ${err && err.message ? err.message : String(err)}`);
+                throw new Error(`GentleDB: failed to construct Low(adapter). Underlying error: ${err && err.message ? err.message : String(err)}`);
             }
 
-            // Perform initial reads and defaults (like your original implementation)
-            try {
-                await this._low.read();
-            } catch (e) {
-                // read may fail if file absent; ignore for now
-            }
+            // initial read + write defaults (mirror previous)
+            try { await this._low.read(); } catch (e) { /* ignore */ }
             if (this._low.data === undefined || this._low.data === null) {
                 this._low.data = GentleDB._cloneSafe(this.opts.defaultData);
-                try { await this._low.write(); } catch (e) { /* ignore write errors here */ }
+                try { await this._low.write(); } catch (e) { /* ignore */ }
             }
             try {
                 await this._low.read();
@@ -128,12 +135,8 @@ class GentleDB {
                 this._lastOnDiskSnapshot = GentleDB._cloneSafe(this.opts.defaultData);
             }
 
-            // Start file watcher if we have a real file path
-            if (this._filePath) {
-                this._startWatcher();
-            }
+            if (this._filePath) this._startWatcher();
 
-            // Return the ready state
             return true;
         })();
     }
@@ -144,12 +147,7 @@ class GentleDB {
     }
 
     off(name, fn) {
-        try {
-            this._ee.off(name, fn);
-            return true;
-        } catch (e) {
-            return false;
-        }
+        try { this._ee.off(name, fn); return true; } catch (e) { return false; }
     }
 
     async read() {
@@ -165,142 +163,160 @@ class GentleDB {
 
     async getAll() {
         await this._initPromise;
-        // returns clone of current data via read flow
         return this.read();
     }
 
+    // findMatches supports large DBs (streaming) and precompiles tokens
     async findMatches(query, opts = {}) {
         await this._initPromise;
-        const cfg = Object.assign({
-            caseSensitive: this.opts.caseSensitive,
-            searchKeys: false,
-            maxMatches: this.opts.maxMatches
-        }, opts);
 
-        const tokens = this._parseToTokens(query, cfg);
-        if (tokens.length === 0) return { partial: [], exact: [] };
+        const cfg = {
+            caseSensitive: opts.caseSensitive ?? this.opts.caseSensitive,
+            searchKeys: Boolean(opts.searchKeys),
+            maxMatches: Math.max(1, Math.floor(opts.maxMatches ?? this._maxMatchesDefault))
+        };
 
-        // read adapter to ensure we have latest on-disk content
+        const rawTokens = this._parseToTokens(query, cfg);
+        if (!rawTokens || rawTokens.length === 0) return { partial: [], exact: [] };
+
+        // precompile normalized tokens to avoid repeated work
+        const tokens = rawTokens.map(t => {
+            if (t.isRegex) {
+                const re = t.regex instanceof RegExp ? t.regex : new RegExp(String(t.token));
+                // anchored version for exactOnly
+                const anchored = t.exactOnly ? new RegExp(`^(?:${re.source})$`, re.flags) : re;
+                return { isRegex: true, regex: re, anchored, exactOnly: Boolean(t.exactOnly) };
+            } else {
+                const tokenNorm = cfg.caseSensitive ? String(t.token) : String(t.token).toLowerCase();
+                return { isRegex: false, tokenNorm, exactOnly: Boolean(t.exactOnly) };
+            }
+        });
+
+        // Ensure latest on-disk content
         await this._low.read();
         const snapshot = GentleDB._cloneSafe(this._low.data === undefined ? {} : this._low.data);
-
-        // Walk tree to collect leaves
-        const leaves = [];
-        const pushLeaf = (origin, val) => leaves.push({ origin: origin || '(root)', val });
-
-        const walk = (node, curPath) => {
-            if (node === null || node === undefined) { pushLeaf(curPath, node); return; }
-            if (Array.isArray(node)) {
-                if (node.length === 0) { pushLeaf(curPath, node); return; }
-                for (let i = 0; i < node.length; i++) walk(node[i], `${curPath || '(root)'}[${i}]`);
-            } else if (typeof node === 'object') {
-                const keys = Object.keys(node);
-                if (keys.length === 0) { pushLeaf(curPath, node); return; }
-                for (const k of keys) {
-                    const childPath = curPath ? `${curPath}.${k}` : k;
-                    if (cfg.searchKeys) pushLeaf(`${childPath}#key`, k);
-                    walk(node[k], childPath);
-                }
-            } else {
-                pushLeaf(curPath, node);
-            }
-        };
-        walk(snapshot, '');
-
-        const leafRecords = leaves.map(l => {
-            const val = l.val;
-            const str = (val === null || val === undefined) ? String(val) : (typeof val === 'object' ? JSON.stringify(val) : String(val));
-            return { origin: l.origin, val, str, norm: cfg.caseSensitive ? str : str.toLowerCase() };
-        });
 
         const partial = [];
         const exact = [];
         const seen = new Set();
-        const limit = Math.max(1, Math.floor(cfg.maxMatches));
+        const limit = cfg.maxMatches;
 
-        for (const tk of tokens) {
-            if (partial.length + exact.length >= limit) break;
-            for (const leaf of leafRecords) {
-                if (partial.length + exact.length >= limit) break;
-                const keyExact = `e:${leaf.origin}:${String(tk.token)}`;
-                const keyPartial = `p:${leaf.origin}:${String(tk.token)}`;
+        // helper: try match one leaf against all tokens
+        const tryMatchLeaf = (origin, leafVal) => {
+            // build string representation once
+            const leafStr = (leafVal === null || leafVal === undefined) ? String(leafVal) : (typeof leafVal === 'object' ? JSON.stringify(leafVal) : String(leafVal));
+            const norm = cfg.caseSensitive ? leafStr : leafStr.toLowerCase();
+
+            for (const tk of tokens) {
+                if (partial.length + exact.length >= limit) return true; // stop traversal
 
                 if (tk.isRegex) {
-                    const re = tk.regex;
-                    if (tk.exactOnly) {
-                        const anchored = new RegExp(`^(?:${re.source})$`, re.flags);
-                        if (anchored.test(leaf.str) && !seen.has(keyExact)) { exact.push({ origin: leaf.origin, match: leaf.val }); seen.add(keyExact); }
-                    } else {
-                        if (re.test(leaf.str) && !seen.has(keyPartial)) { partial.push({ origin: leaf.origin, match: leaf.val }); seen.add(keyPartial); }
+                    const re = tk.exactOnly ? tk.anchored : tk.regex;
+                    const key = `r:${origin}:${re.source}:${re.flags}:${tk.exactOnly ? 'e' : 'p'}`;
+                    if (re.test(leafStr) && !seen.has(key)) {
+                        if (tk.exactOnly) exact.push({ origin, match: leafVal }); else partial.push({ origin, match: leafVal });
+                        seen.add(key);
                     }
-                    continue;
-                }
-
-                const tokenNorm = cfg.caseSensitive ? tk.token : tk.token.toLowerCase();
-
-                if (leaf.norm === tokenNorm) {
-                    if (!seen.has(keyExact)) { exact.push({ origin: leaf.origin, match: leaf.val }); seen.add(keyExact); }
-                    continue;
-                }
-                if (tk.exactOnly) continue;
-                if (leaf.norm.includes(tokenNorm)) {
-                    if (!seen.has(keyPartial)) { partial.push({ origin: leaf.origin, match: leaf.val }); seen.add(keyPartial); }
+                } else {
+                    const keyExact = `e:${origin}:${tk.tokenNorm}`;
+                    const keyPartial = `p:${origin}:${tk.tokenNorm}`;
+                    if (norm === tk.tokenNorm) {
+                        if (!seen.has(keyExact)) { exact.push({ origin, match: leafVal }); seen.add(keyExact); }
+                        continue;
+                    }
+                    if (tk.exactOnly) continue;
+                    if (norm.includes(tk.tokenNorm)) {
+                        if (!seen.has(keyPartial)) { partial.push({ origin, match: leafVal }); seen.add(keyPartial); }
+                    }
                 }
             }
-        }
+            return partial.length + exact.length >= limit;
+        };
+
+        // streaming walk (stop when limit reached)
+        const walk = (node, curPath) => {
+            if (partial.length + exact.length >= limit) return true;
+            if (node === null || node === undefined) {
+                if (tryMatchLeaf(curPath || '(root)', node)) return true;
+                return false;
+            }
+            if (Array.isArray(node)) {
+                if (node.length === 0) {
+                    if (tryMatchLeaf(curPath || '(root)', node)) return true;
+                    return false;
+                }
+                for (let i = 0; i < node.length; i++) {
+                    if (walk(node[i], `${curPath || '(root)'}[${i}]`)) return true;
+                }
+            } else if (typeof node === 'object') {
+                const keys = Object.keys(node);
+                if (keys.length === 0) {
+                    if (tryMatchLeaf(curPath || '(root)', node)) return true;
+                    return false;
+                }
+                for (const k of keys) {
+                    const childPath = curPath ? `${curPath}.${k}` : k;
+                    if (cfg.searchKeys) {
+                        if (tryMatchLeaf(`${childPath}#key`, k)) return true;
+                    }
+                    if (walk(node[k], childPath)) return true;
+                }
+            } else {
+                if (tryMatchLeaf(curPath || '(root)', node)) return true;
+            }
+            return partial.length + exact.length >= limit;
+        };
+
+        walk(snapshot, '');
 
         return { partial, exact };
     }
 
     async close() {
         try {
-            if (this._watcher && typeof this._watcher.close === 'function') this._watcher.close();
-            if (this._filePath) fs.unwatchFile(this._filePath);
+            if (this._watcher && typeof this._watcher.close === 'function') {
+                try { this._watcher.close(); } catch (e) { /* ignore */ }
+                this._watcher = null;
+            }
+            if (this._usingWatchFile && this._filePath) {
+                try { fs.unwatchFile(this._filePath); } catch (e) { /* ignore */ }
+                this._usingWatchFile = false;
+            }
         } catch (e) { /* ignore */ }
-        this._watcher = null;
+
         try { await this._releaseLock(); } catch (e) { /* ignore */ }
+
+        GentleDB._instances.delete(this);
     }
 
-    // Helpers
+    // -- internals --
 
     static async _loadLowdbModule() {
-        // Try synchronous require first (most users on older lowdb or bundlers)
+        // try require first
         try {
             const m = require('lowdb');
-            // Some versions export JSONFile alongside Low
             if (m && m.Low && m.JSONFile) return { Low: m.Low, JSONFile: m.JSONFile };
-
-            // Some older docs suggest JSONFile lives at 'lowdb/node' -> attempt to require it.
             try {
                 const nodePart = require('lowdb/node');
-                if (nodePart && nodePart.JSONFile) return { Low: m.Low || m.Low, JSONFile: nodePart.JSONFile };
+                if (nodePart && nodePart.JSONFile) return { Low: m.Low, JSONFile: nodePart.JSONFile };
             } catch (e) { /* ignore */ }
-
-            // If JSONFile isn't present but Low is, we can still proceed relying on consumer providing adapter
-            if (m && m.Low) {
-                if (m.JSONFile) return { Low: m.Low, JSONFile: m.JSONFile };
-                // attempt dynamic import to locate JSONFile (some installs export it from lowdb/node under ESM)
-            }
+            if (m && m.Low) return { Low: m.Low, JSONFile: m.JSONFile || undefined };
         } catch (err) {
-            // require may fail for ESM packages — we'll fallback to dynamic import below
+            // ignore, fallback to dynamic import
         }
 
-        // Fallback: dynamic import (works if Node supports it and package is ESM)
+        // fallback dynamic import
         try {
-            // Try import('lowdb') first
             const mod = await import('lowdb').then(m => m).catch(() => null);
             const modNode = await import('lowdb/node').then(m => m).catch(() => null);
 
-            const Low = mod && (mod.Low || mod.default?.Low) ? (mod.Low || mod.default?.Low) : (modNode && (modNode.Low || modNode.default?.Low) ? (modNode.Low || modNode.default?.Low) : null);
-            const JSONFile = (mod && (mod.JSONFile || mod.default?.JSONFile)) || (modNode && (modNode.JSONFile || modNode.default?.JSONFile));
-            if (Low && JSONFile) return { Low, JSONFile };
+            const Low = (mod && (mod.Low || mod.default?.Low)) || (modNode && (modNode.Low || modNode.default?.Low)) || null;
+            const JSONFile = (mod && (mod.JSONFile || mod.default?.JSONFile)) || (modNode && (modNode.JSONFile || modNode.default?.JSONFile)) || undefined;
 
-            // If Low found but JSONFile not found, return Low and leave JSONFile undefined (adapter must be provided)
-            if (Low) return { Low, JSONFile: JSONFile };
-
-            throw new Error('Could not locate lowdb exports (Low/JSONFile). Ensure lowdb is installed (npm i lowdb) and that your Node environment supports ESM or use a compatible lowdb version.');
+            if (Low) return { Low, JSONFile };
+            throw new Error('Could not locate lowdb exports (Low/JSONFile).');
         } catch (err) {
-            throw new Error(`GentleDB requires lowdb (v3+). Failed to load lowdb dynamically: ${err && err.message ? err.message : String(err)}. Install lowdb via: npm i lowdb`);
+            throw new Error(`GentleDB requires lowdb (v3+). Failed to load lowdb: ${err && err.message ? err.message : String(err)}. Install lowdb via: npm i lowdb`);
         }
     }
 
@@ -311,6 +327,8 @@ class GentleDB {
                 const res = l(evt);
                 if (res && typeof res.then === 'function') await res;
             } catch (err) {
+                // log and accumulate errors
+                console.error(`GentleDB listener error for ${name}:`, err);
                 evt._listenerError = evt._listenerError || [];
                 evt._listenerError.push({ listener: l, error: err });
             }
@@ -359,7 +377,7 @@ class GentleDB {
                         for (const rej of pending.rejecters) rej(err);
                     }
                 });
-            }, Math.max(0, Number(this.opts.debounceReadMs) || 0));
+            }, this._debounceReadMs);
         });
     }
 
@@ -402,7 +420,6 @@ class GentleDB {
 
                         // Update runtime
                         const finalData = GentleDB._cloneSafe(beforeEvt.newData);
-                        // set into _low.data before write
                         if (!this._low) throw new Error('GentleDB internal error: lowdb instance not initialized.');
                         this._low.data = finalData;
 
@@ -438,18 +455,18 @@ class GentleDB {
 
                         for (const r of pending.resolvers) r();
                     } catch (err) {
-                        // ensure lock release
                         try { this._suppressWatchEvents = false; this._isWriting = false; await this._releaseLock(); } catch (e) { /* ignore */ }
                         for (const rej of pending.rejecters) rej(err);
                     }
                 });
-            }, Math.max(0, Number(this.opts.debounceWriteMs) || 0));
+            }, this._debounceWriteMs);
         });
     }
 
     _startWatcher() {
         if (!this._filePath) return;
         if (this._watcher) return;
+
         try {
             let schedule = null;
             const onFSChange = (eventType, filename) => {
@@ -461,28 +478,43 @@ class GentleDB {
                         const evt = { type: 'watcher:error', error: err, filename: this._filePath };
                         this._ee.emit('watcher:error', evt);
                     });
-                }, Math.max(10, Number(this.opts.watchDebounceMs) || 75));
+                }, this._watchDebounceMs);
             };
 
             // Prefer fs.watch, fallback to fs.watchFile
             try {
-                this._watcher = fs.watch(this._filePath, { persistent: true }, onFSChange);
+                this._watcher = fs.watch(this._filePath, { persistent: true }, (evt, filename) => {
+                    // fs.watch sometimes returns event type 'rename' when file is deleted/moved — robust handling below
+                    if (evt === 'rename') {
+                        // check if file still exists
+                        fsp.stat(this._filePath).then(() => onFSChange('rename', filename)).catch(() => {
+                            // file missing; trigger change handling which will read the file (and fail gracefully)
+                            onFSChange('rename', filename);
+                        });
+                    } else {
+                        onFSChange(evt, filename);
+                    }
+                });
                 this._watcher.on('error', (err) => {
+                    // fallback to watchFile
                     try { fs.unwatchFile(this._filePath); } catch (e) { /* ignore */ }
                     this._watcher = null;
-                    fs.watchFile(this._filePath, { interval: Math.max(50, this.opts.watchDebounceMs || 75) }, (curr, prev) => {
+                    this._usingWatchFile = true;
+                    fs.watchFile(this._filePath, { interval: Math.max(50, this._watchDebounceMs) }, (curr, prev) => {
                         if (this._suppressWatchEvents) return;
                         if (curr.mtimeMs !== prev.mtimeMs) onFSChange('change', path.basename(this._filePath));
                     });
                 });
             } catch (err) {
-                fs.watchFile(this._filePath, { interval: Math.max(50, this.opts.watchDebounceMs || 75) }, (curr, prev) => {
+                this._usingWatchFile = true;
+                fs.watchFile(this._filePath, { interval: Math.max(50, this._watchDebounceMs) }, (curr, prev) => {
                     if (this._suppressWatchEvents) return;
                     if (curr.mtimeMs !== prev.mtimeMs) onFSChange('change', path.basename(this._filePath));
                 });
             }
         } catch (e) {
             this._watcher = null;
+            this._usingWatchFile = false;
         }
     }
 
@@ -490,20 +522,15 @@ class GentleDB {
         if (this._isWriting || this._suppressWatchEvents) return;
 
         try {
-            // Capture runtime state BEFORE reading from disk (fixes false-negative change detection)
             const oldRuntime = GentleDB._cloneSafe(this._low && this._low.data !== undefined ? this._low.data : {});
-
-            // Read the adapter to get latest disk state
             await this._low.read();
             const diskSnapshot = GentleDB._cloneSafe(this._low.data === undefined ? {} : this._low.data);
 
-            // If disk matches last known on-disk snapshot, update snapshot and return
-            if (this._jsonEqual(diskSnapshot, this._lastOnDiskSnapshot)) {
+            if (this._deepEqual(diskSnapshot, this._lastOnDiskSnapshot)) {
                 this._lastOnDiskSnapshot = GentleDB._cloneSafe(diskSnapshot);
                 return;
             }
 
-            // Apply the disk contents into runtime and update last snapshot
             this._low.data = GentleDB._cloneSafe(diskSnapshot);
             this._lastOnDiskSnapshot = GentleDB._cloneSafe(diskSnapshot);
 
@@ -526,22 +553,35 @@ class GentleDB {
     async _acquireLock() {
         if (!this._lockPath) return;
         const start = Date.now();
-        const retryDelay = Math.max(10, Number(this.opts.lockRetryDelayMs) || 50);
-        const timeout = Math.max(0, Number(this.opts.lockTimeoutMs) || 5000);
-        const staleMs = Math.max(1000, Number(this.opts.lockStaleMs) || 10000);
+        const retryDelay = this._lockRetryDelayMs;
+        const timeout = this._lockTimeoutMs;
+        const staleMs = this._lockStaleMs;
 
         while (true) {
             try {
-                const handle = await fsp.open(this._lockPath, 'wx'); // fails if exists
+                // attempt exclusive create
+                const handle = await fsp.open(this._lockPath, 'wx');
                 const payload = JSON.stringify({ pid: process.pid, ts: Date.now() });
                 await handle.writeFile(payload, { encoding: 'utf8' });
+
+                // try to flush to disk if API available (best-effort)
+                try {
+                    if (typeof handle.datasync === 'function') {
+                        await handle.datasync();
+                    } else if (typeof handle.sync === 'function') {
+                        await handle.sync();
+                    }
+                } catch (e) {
+                    // ignore - best-effort
+                }
+
+                // keep handle to allow us to close/unlink later
                 this._heldLockHandle = handle;
                 return;
             } catch (err) {
                 if (err && err.code === 'EEXIST') {
-                    // Attempt to detect stale lock more robustly:
+                    // file exists - check if stale
                     try {
-                        // Try to read and parse the lock file for ts field
                         let content = null;
                         try {
                             content = await fsp.readFile(this._lockPath, 'utf8');
@@ -554,10 +594,9 @@ class GentleDB {
                                 }
                             }
                         } catch (e) {
-                            // If read or parse fails, fall back to mtime check below
+                            // parse/read failed - fallback to mtime
                         }
 
-                        // Fallback to mtime check
                         try {
                             const stat = await fsp.stat(this._lockPath);
                             const now = Date.now();
@@ -566,12 +605,11 @@ class GentleDB {
                                 continue;
                             }
                         } catch (e) {
-                            // If stat fails, try to remove the lock file as a last resort
+                            // stat failed - try unlink as last resort
                             try { await fsp.unlink(this._lockPath); } catch (e2) { /* ignore */ }
                             continue;
                         }
                     } catch (e) {
-                        // any unexpected errors — attempt unlink and continue
                         try { await fsp.unlink(this._lockPath); } catch (e2) { /* ignore */ }
                         continue;
                     }
@@ -620,29 +658,63 @@ class GentleDB {
         for (const k of keys) {
             const a = (oldObj || {})[k];
             const b = (newObj || {})[k];
-            if (!this._jsonEqual(a, b)) out[k] = { old: GentleDB._cloneSafe(a), new: GentleDB._cloneSafe(b) };
+            if (!this._deepEqual(a, b)) out[k] = { old: GentleDB._cloneSafe(a), new: GentleDB._cloneSafe(b) };
         }
         return out;
     }
 
-    _jsonEqual(a, b) {
-        try { return stableStringify(a) === stableStringify(b); } catch (e) { return a === b; }
-    }
-
+    // Use structuredClone if available; otherwise safe JSON fallback
     static _cloneSafe(x) {
+        if (typeof globalThis !== 'undefined' && typeof globalThis.structuredClone === 'function') {
+            try { return structuredClone(x); } catch (e) { /* fallback */ }
+        }
         try { return x === undefined ? undefined : JSON.parse(JSON.stringify(x)); } catch (e) { return x; }
     }
 
+    // Short-circuiting deep equal for common shapes (fast for large objects)
+    _deepEqual(a, b) {
+        if (a === b) return true;
+        if (a == null || b == null) return a === b;
+        if (typeof a !== typeof b) return false;
+        if (typeof a !== 'object') return a === b;
+
+        // arrays
+        if (Array.isArray(a) || Array.isArray(b)) {
+            if (!Array.isArray(a) || !Array.isArray(b)) return false;
+            if (a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i++) {
+                if (!this._deepEqual(a[i], b[i])) return false;
+            }
+            return true;
+        }
+
+        const aKeys = Object.keys(a);
+        const bKeys = Object.keys(b);
+        if (aKeys.length !== bKeys.length) return false;
+
+        for (const k of aKeys) {
+            if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+            if (!this._deepEqual(a[k], b[k])) return false;
+        }
+        return true;
+    }
+
     _deepMerge(a, b) {
+        // defensive: if b undefined return a
         if (b === undefined) return a;
+        // if a missing/primitive, clone b
         if (a === undefined || a === null) return GentleDB._cloneSafe(b);
-        if (typeof a !== 'object' || typeof b !== 'object' || Array.isArray(b) || Array.isArray(a)) return GentleDB._cloneSafe(b);
+        if (typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) || Array.isArray(b)) return GentleDB._cloneSafe(b);
+
+        // mutate a intentionally for speed, but avoid prototype-pollution keys
         for (const k of Object.keys(b)) {
-            if (b[k] === undefined) continue;
-            if (typeof b[k] === 'object' && b[k] !== null && !Array.isArray(b[k])) {
-                a[k] = this._deepMerge(a[k] === undefined ? {} : a[k], b[k]);
+            if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+            const bv = b[k];
+            if (bv === undefined) continue;
+            if (typeof bv === 'object' && bv !== null && !Array.isArray(bv)) {
+                a[k] = this._deepMerge(a[k] === undefined ? {} : a[k], bv);
             } else {
-                a[k] = GentleDB._cloneSafe(b[k]);
+                a[k] = GentleDB._cloneSafe(bv);
             }
         }
         return a;
@@ -654,6 +726,10 @@ class GentleDB {
         let cur = root;
         for (const part of parts) {
             if (cur === undefined || cur === null) return undefined;
+            // avoid accessing inherited properties unexpectedly
+            if (!Object.prototype.hasOwnProperty.call(cur, part) && typeof cur !== 'function') {
+                // accessing cur[part] on primitives returns undefined; we already guard above
+            }
             cur = cur[part];
         }
         return cur;
@@ -672,31 +748,46 @@ class GentleDB {
         }
         const parts = this._splitPath(pathStr);
         let cur = root;
+
         for (let i = 0; i < parts.length - 1; i++) {
             const p = parts[i];
             const nextPart = parts[i + 1];
-            // create array if next part is numeric index and current missing/ not array
-            const nextIsIndex = /^\d+$/.test(String(nextPart));
+
+            // micro-opt: simple numeric check (avoid regex every time)
+            const np = nextPart;
+            const nextIsIndex = (typeof np === 'string' && np.length > 0 && /^[0-9]+$/.test(np));
+
             if (cur[p] === undefined || cur[p] === null) cur[p] = nextIsIndex ? [] : {};
             cur = cur[p];
-            if (typeof cur !== 'object') cur = cur[parts[i]] = {};
+
+            // if cur ended up being primitive, replace with empty object
+            if (cur === null || (typeof cur !== 'object' && !Array.isArray(cur))) {
+                cur = cur[parts[i]] = {};
+            }
         }
+
         const last = parts[parts.length - 1];
-        // clone value when setting
         cur[last] = GentleDB._cloneSafe(value);
     }
 
     _deleteAtPath(root, pathStr) {
-        if (!pathStr || pathStr === '') return;
+        if (!pathStr) return;
         const parts = this._splitPath(pathStr);
-        let cur = root;
+        if (parts.length === 0) return;
+
+        let parent = root;
         for (let i = 0; i < parts.length - 1; i++) {
-            const p = parts[i];
-            if (cur[p] === undefined) return;
-            cur = cur[p];
-            if (cur === undefined || cur === null) return;
+            const key = parts[i];
+
+            if (parent == null || parent[key] === undefined) return;
+            parent = parent[key];
+            if (parent == null || (typeof parent !== 'object' && !Array.isArray(parent))) return;
         }
-        delete cur[parts[parts.length - 1]];
+
+        const lastKey = parts[parts.length - 1];
+        if (parent != null && Object.prototype.hasOwnProperty.call(parent, lastKey)) {
+            delete parent[lastKey];
+        }
     }
 
     _splitPath(pathStr) {
@@ -744,7 +835,7 @@ class GentleDB {
                 try {
                     const r = new RegExp(regexLike[1], regexLike[2] || (cfg.caseSensitive ? '' : 'i'));
                     return { token: r, exactOnly: Boolean(obj.exactOnly), isRegex: true, regex: r };
-                } catch (e) { }
+                } catch (e) { /* fall-through */ }
             }
             const t = cfg.caseSensitive ? s : s.toLowerCase();
             return { token: t, exactOnly: Boolean(obj.exactOnly), isRegex: false };
