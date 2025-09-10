@@ -13,7 +13,7 @@ class GentleDB {
     static _exitHandlerRegistered = false;
 
     constructor(adapterOrPath, opts = {}) {
-        // Normalize options once
+        // Default options
         const defaultOpts = {
             debounceWriteMs: 100,
             debounceReadMs: 50,
@@ -23,11 +23,12 @@ class GentleDB {
             lockRetryDelayMs: 50,
             lockTimeoutMs: 5000,
             lockStaleMs: 10000,
-            watchDebounceMs: 75
+            watchDebounceMs: 75,
+            registerExitHandlers: true
         };
         this.opts = Object.assign({}, defaultOpts, opts);
 
-        // Normalize numeric options (clamp / coerce)
+        // Normalized numeric options
         this._debounceWriteMs = Math.max(0, Number(this.opts.debounceWriteMs) || 0);
         this._debounceReadMs = Math.max(0, Number(this.opts.debounceReadMs) || 0);
         this._lockRetryDelayMs = Math.max(10, Number(this.opts.lockRetryDelayMs) || 50);
@@ -36,6 +37,9 @@ class GentleDB {
         this._watchDebounceMs = Math.max(10, Number(this.opts.watchDebounceMs) || 75);
         this._maxMatchesDefault = Math.max(1, Math.floor(this.opts.maxMatches || 1000));
         this.opts.caseSensitive = Boolean(this.opts.caseSensitive);
+
+        // store structuredClone availability once to reduce checks
+        this._supportsStructuredClone = (typeof globalThis !== 'undefined' && typeof globalThis.structuredClone === 'function');
 
         // Event emitter
         this._ee = new EventEmitter();
@@ -61,9 +65,16 @@ class GentleDB {
         this._isWriting = false;
         this._lastOnDiskSnapshot = null;
 
-        // register instance and exit handler once
+        // manual lock override flag (used by unlock(permanent=true))
+        this._manualUnlocked = false;
+
+        // event chain stack used for preventChain semantics
+        // push event contexts here while emitting; listeners can call evt.preventChain()
+        this._activeEventStack = [];
+
+        // register instance and exit handler once (optional)
         GentleDB._instances.add(this);
-        if (!GentleDB._exitHandlerRegistered) {
+        if (!GentleDB._exitHandlerRegistered && this.opts.registerExitHandlers) {
             GentleDB._exitHandlerRegistered = true;
             const cleanup = () => {
                 for (const inst of GentleDB._instances) {
@@ -76,7 +87,6 @@ class GentleDB {
                 }
             };
             process.on('exit', cleanup);
-            // attempt best-effort on signals
             process.on('SIGINT', () => { cleanup(); process.exit(130); });
             process.on('SIGTERM', () => { cleanup(); process.exit(143); });
         }
@@ -122,7 +132,7 @@ class GentleDB {
                 throw new Error(`GentleDB: failed to construct Low(adapter). Underlying error: ${err && err.message ? err.message : String(err)}`);
             }
 
-            // initial read + write defaults (mirror previous)
+            // initial read + write defaults
             try { await this._low.read(); } catch (e) { /* ignore */ }
             if (this._low.data === undefined || this._low.data === null) {
                 this._low.data = GentleDB._cloneSafe(this.opts.defaultData);
@@ -142,6 +152,16 @@ class GentleDB {
     }
 
     on(name, fn) {
+        const deprecated = new Set(['beforeread', 'beforewrite', 'afterread', 'afterwrite']);
+        if (deprecated.has(String(name))) {
+            try {
+                const warnKey = `__warned_${name}`;
+                if (!this[warnKey]) {
+                    console.warn(`GentleDB: event "${name}" is deprecated and will be removed in 1.1.0. Use canonical events (write, read, change, lock, unlock, error).`);
+                    this[warnKey] = true;
+                }
+            } catch (e) { /* ignore */ }
+        }
         this._ee.on(name, fn);
         return () => { try { this._ee.off(name, fn); } catch (e) { /* ignore */ } };
     }
@@ -158,6 +178,7 @@ class GentleDB {
     async write(partialOrFullData = undefined, opts = {}) {
         await this._initPromise;
         const useReplace = Boolean(opts.replace);
+        // op will be 'replace' inside evt.op when replace requested, but event.type remains 'write' (no replace event yet)
         return this._debouncedWrite(partialOrFullData, { replace: useReplace });
     }
 
@@ -166,7 +187,7 @@ class GentleDB {
         return this.read();
     }
 
-    // findMatches supports large DBs (streaming) and precompiles tokens
+    // findMatches: streaming, safe for large DBs
     async findMatches(query, opts = {}) {
         await this._initPromise;
 
@@ -179,11 +200,10 @@ class GentleDB {
         const rawTokens = this._parseToTokens(query, cfg);
         if (!rawTokens || rawTokens.length === 0) return { partial: [], exact: [] };
 
-        // precompile normalized tokens to avoid repeated work
+        // precompile normalized tokens
         const tokens = rawTokens.map(t => {
             if (t.isRegex) {
                 const re = t.regex instanceof RegExp ? t.regex : new RegExp(String(t.token));
-                // anchored version for exactOnly
                 const anchored = t.exactOnly ? new RegExp(`^(?:${re.source})$`, re.flags) : re;
                 return { isRegex: true, regex: re, anchored, exactOnly: Boolean(t.exactOnly) };
             } else {
@@ -201,15 +221,12 @@ class GentleDB {
         const seen = new Set();
         const limit = cfg.maxMatches;
 
-        // helper: try match one leaf against all tokens
         const tryMatchLeaf = (origin, leafVal) => {
-            // build string representation once
             const leafStr = (leafVal === null || leafVal === undefined) ? String(leafVal) : (typeof leafVal === 'object' ? JSON.stringify(leafVal) : String(leafVal));
             const norm = cfg.caseSensitive ? leafStr : leafStr.toLowerCase();
 
             for (const tk of tokens) {
-                if (partial.length + exact.length >= limit) return true; // stop traversal
-
+                if (partial.length + exact.length >= limit) return true;
                 if (tk.isRegex) {
                     const re = tk.exactOnly ? tk.anchored : tk.regex;
                     const key = `r:${origin}:${re.source}:${re.flags}:${tk.exactOnly ? 'e' : 'p'}`;
@@ -233,7 +250,6 @@ class GentleDB {
             return partial.length + exact.length >= limit;
         };
 
-        // streaming walk (stop when limit reached)
         const walk = (node, curPath) => {
             if (partial.length + exact.length >= limit) return true;
             if (node === null || node === undefined) {
@@ -289,6 +305,63 @@ class GentleDB {
         GentleDB._instances.delete(this);
     }
 
+    // lock(permanent: boolean) - public
+    async lock(permanent = false) {
+        await this._initPromise;
+        if (!this._lockPath) return false;
+        // If chain suppression active, perform lock without emitting events
+        if (!this._canEmit()) {
+            await this._acquireLock();
+            if (permanent) this._manualUnlocked = false;
+            return true;
+        }
+
+        const evt = this._makeEvent('lock', 'lock', this._low && this._low.data, this._low && this._low.data);
+        await this._emitSequential('lock', evt);
+        // legacy compatibility: emit before/after if listeners expect them
+        const legacyBefore = this._makeEvent('beforewrite', 'lock', evt.oldData, evt.newData);
+        await this._emitSequential('beforewrite', legacyBefore);
+        if (evt.defaultPrevented || legacyBefore._prevented) return evt._result ?? legacyBefore._result;
+
+        await this._acquireLock();
+        if (permanent) this._manualUnlocked = false;
+
+        const legacyAfter = this._makeEvent('afterwrite', 'lock', evt.oldData, evt.newData);
+        await this._emitSequential('afterwrite', legacyAfter);
+
+        return true;
+    }
+
+    async unlock(permanent = false) {
+        await this._initPromise;
+        if (!this._lockPath) return false;
+        if (!this._canEmit()) {
+            await this._releaseLock();
+            if (permanent) this._manualUnlocked = true;
+            return true;
+        }
+
+        const evt = this._makeEvent('unlock', 'unlock', this._low && this._low.data, this._low && this._low.data);
+        await this._emitSequential('unlock', evt);
+        const legacyBefore = this._makeEvent('beforewrite', 'unlock', evt.oldData, evt.newData);
+        await this._emitSequential('beforewrite', legacyBefore);
+        if (evt.defaultPrevented || legacyBefore._prevented) return evt._result ?? legacyBefore._result;
+
+        await this._releaseLock();
+        if (permanent) this._manualUnlocked = true;
+
+        const legacyAfter = this._makeEvent('afterwrite', 'unlock', evt.oldData, evt.newData);
+        await this._emitSequential('afterwrite', legacyAfter);
+
+        return true;
+    }
+
+    restoreLock() {
+        this._manualUnlocked = false;
+        try { this._ee.emit('restoreLock', { type: 'restoreLock', timestamp: Date.now() }); } catch (e) { /* ignore */ }
+        return true;
+    }
+
     // -- internals --
 
     static async _loadLowdbModule() {
@@ -320,18 +393,36 @@ class GentleDB {
         }
     }
 
+    // Check whether emitting events is allowed (inspect active event stack for preventChain)
+    _canEmit() {
+        for (let i = this._activeEventStack.length - 1; i >= 0; i--) {
+            const ctx = this._activeEventStack[i];
+            if (ctx && ctx.chainPrevented) return false;
+        }
+        return true;
+    }
+
+    // Emit sequentially to each listener. If chain suppressed, skip calling listeners but return the event object.
     async _emitSequential(name, evt) {
+        if (!this._canEmit()) return evt;
+
         const listeners = this._ee.listeners(name).slice();
-        for (const l of listeners) {
-            try {
-                const res = l(evt);
-                if (res && typeof res.then === 'function') await res;
-            } catch (err) {
-                // log and accumulate errors
-                console.error(`GentleDB listener error for ${name}:`, err);
-                evt._listenerError = evt._listenerError || [];
-                evt._listenerError.push({ listener: l, error: err });
+
+        // push ctx for preventChain semantics
+        this._activeEventStack.push(evt);
+        try {
+            for (const l of listeners) {
+                try {
+                    const res = l(evt);
+                    if (res && typeof res.then === 'function') await res;
+                } catch (err) {
+                    console.error(`GentleDB listener error for ${name}:`, err);
+                    evt._listenerError = evt._listenerError || [];
+                    evt._listenerError.push({ listener: l, error: err });
+                }
             }
+        } finally {
+            this._activeEventStack.pop();
         }
         return evt;
     }
@@ -351,27 +442,33 @@ class GentleDB {
                 this._chain = this._chain.then(async () => {
                     try {
                         const old = GentleDB._cloneSafe(this._low && this._low.data !== undefined ? this._low.data : {});
-                        const beforereadEvt = this._makeEvent('beforeread', old, GentleDB._cloneSafe(old));
-                        await this._emitSequential('beforeread', beforereadEvt);
 
-                        if (beforereadEvt._prevented) {
-                            const result = (typeof beforereadEvt._result !== 'undefined') ? await beforereadEvt._result : GentleDB._cloneSafe(beforereadEvt.newData);
-                            const readEvt = this._makeEvent('read', old, GentleDB._cloneSafe(result));
+                        // Emit canonical pre-read 'read' (cancellable) and legacy 'beforeread'
+                        if (this._canEmit()) {
+                            const readEvt = this._makeEvent('read', 'read', old, GentleDB._cloneSafe(old));
                             await this._emitSequential('read', readEvt);
-                            const afterEvt = this._makeEvent('afterread', old, GentleDB._cloneSafe(result));
-                            await this._emitSequential('afterread', afterEvt);
-                            for (const r of pending.resolvers) r(GentleDB._cloneSafe(result));
-                            return;
+                            const legacyBefore = this._makeEvent('beforeread', 'read', old, GentleDB._cloneSafe(old));
+                            await this._emitSequential('beforeread', legacyBefore);
+
+                            if (readEvt.defaultPrevented || legacyBefore._prevented) {
+                                const result = (typeof readEvt._result !== 'undefined') ? readEvt._result : legacyBefore._result;
+                                // emit legacy afterread for compatibility
+                                const afterEvt = this._makeEvent('afterread', 'read', old, GentleDB._cloneSafe(result));
+                                if (this._canEmit()) await this._emitSequential('afterread', afterEvt);
+                                for (const r of pending.resolvers) r(GentleDB._cloneSafe(result));
+                                return;
+                            }
                         }
 
-                        // adapter read
+                        // perform adapter read
                         await this._low.read();
                         const snapshot = GentleDB._cloneSafe(this._low.data === undefined ? {} : this._low.data);
                         try { this._lastOnDiskSnapshot = GentleDB._cloneSafe(snapshot); } catch (e) { /* ignore */ }
-                        const readEvt = this._makeEvent('read', old, GentleDB._cloneSafe(snapshot));
-                        await this._emitSequential('read', readEvt);
-                        const afterEvt = this._makeEvent('afterread', old, GentleDB._cloneSafe(snapshot));
-                        await this._emitSequential('afterread', afterEvt);
+
+                        // emit legacy post-read for compatibility (post-read)
+                        const afterEvt = this._makeEvent('afterread', 'read', old, GentleDB._cloneSafe(snapshot));
+                        if (this._canEmit()) await this._emitSequential('afterread', afterEvt);
+
                         for (const r of pending.resolvers) r(GentleDB._cloneSafe(snapshot));
                     } catch (err) {
                         for (const rej of pending.rejecters) rej(err);
@@ -406,51 +503,72 @@ class GentleDB {
                             else proposed = this._deepMerge(GentleDB._cloneSafe(oldData), pending.data);
                         }
 
-                        // beforewrite
-                        const beforeEvt = this._makeEvent('beforewrite', oldData, GentleDB._cloneSafe(proposed));
-                        await this._emitSequential('beforewrite', beforeEvt);
+                        // op name (for evt.op) — 'replace' may be requested but no replace event type exists yet
+                        const opName = (pending.opts && pending.opts.replace) ? 'replace' : 'write';
+                        const eventType = 'write'; // canonical event type (replace as separate type reserved for 1.1.0)
 
-                        if (beforeEvt._prevented) {
-                            if (typeof beforeEvt._result !== 'undefined') await Promise.resolve(beforeEvt._result);
-                            for (const r of pending.resolvers) r();
-                            const afterEvt = this._makeEvent('afterwrite', oldData, GentleDB._cloneSafe(beforeEvt.newData));
-                            await this._emitSequential('afterwrite', afterEvt);
-                            return;
+                        // pre-write emission
+                        let writeEvt, legacyBefore;
+                        if (this._canEmit()) {
+                            writeEvt = this._makeEvent(eventType, opName, oldData, GentleDB._cloneSafe(proposed));
+                            await this._emitSequential(eventType, writeEvt);
+
+                            legacyBefore = this._makeEvent('beforewrite', opName, oldData, GentleDB._cloneSafe(proposed));
+                            await this._emitSequential('beforewrite', legacyBefore);
+
+                            // If prevented by either canonical or legacy, respect result and skip actual write
+                            if (writeEvt.defaultPrevented || legacyBefore._prevented) {
+                                const chosen = (typeof writeEvt._result !== 'undefined') ? writeEvt._result : legacyBefore._result;
+                                // emit legacy afterwrite for compatibility
+                                const afterCompat = this._makeEvent('afterwrite', opName, oldData, GentleDB._cloneSafe(writeEvt && writeEvt.newData !== undefined ? writeEvt.newData : legacyBefore.newData));
+                                if (this._canEmit()) await this._emitSequential('afterwrite', afterCompat);
+                                for (const r of pending.resolvers) r(chosen);
+                                return;
+                            }
+
+                            // Prefer writeEvt.newData if listener mutated it; else fallback to legacyBefore.newData, else proposed
+                            if (writeEvt && typeof writeEvt.newData !== 'undefined') {
+                                proposed = GentleDB._cloneSafe(writeEvt.newData);
+                            } else if (legacyBefore && typeof legacyBefore.newData !== 'undefined') {
+                                proposed = GentleDB._cloneSafe(legacyBefore.newData);
+                            } else {
+                                proposed = GentleDB._cloneSafe(proposed);
+                            }
                         }
 
-                        // Update runtime
-                        const finalData = GentleDB._cloneSafe(beforeEvt.newData);
+                        // Update runtime using proposed (may have been mutated by listeners)
+                        const finalData = GentleDB._cloneSafe(proposed);
                         if (!this._low) throw new Error('GentleDB internal error: lowdb instance not initialized.');
                         this._low.data = finalData;
 
-                        // Acquire lock
+                        // Acquire lock, persist
                         await this._acquireLock();
                         this._isWriting = true;
                         this._suppressWatchEvents = true;
 
-                        const writeEvt = this._makeEvent('write', oldData, GentleDB._cloneSafe(finalData));
-                        await this._emitSequential('write', writeEvt);
-
-                        // persist
                         try {
                             await this._low.write();
                             try { this._lastOnDiskSnapshot = GentleDB._cloneSafe(this._low.data === undefined ? {} : this._low.data); } catch (e) { /* ignore */ }
                         } finally {
-                            // release flags & lock
                             this._suppressWatchEvents = false;
                             this._isWriting = false;
                             try { await this._releaseLock(); } catch (e) { /* ignore */ }
                         }
 
-                        const afterEvt = this._makeEvent('afterwrite', oldData, GentleDB._cloneSafe(finalData));
-                        await this._emitSequential('afterwrite', afterEvt);
+                        // legacy afterwrite
+                        if (this._canEmit()) {
+                            const afterEvt = this._makeEvent('afterwrite', opName, oldData, GentleDB._cloneSafe(finalData));
+                            await this._emitSequential('afterwrite', afterEvt);
+                        }
 
-                        // compute top-level changes and emit change
+                        // compute and emit change (non-cancellable)
                         const changes = this._computeTopLevelChanges(oldData, finalData);
                         if (Object.keys(changes).length > 0) {
-                            const changeEvt = this._makeEvent('change', oldData, GentleDB._cloneSafe(finalData));
+                            const changeEvt = this._makeEvent('change', opName, oldData, GentleDB._cloneSafe(finalData));
                             changeEvt.changes = changes;
-                            await this._emitSequential('change', changeEvt);
+                            changeEvt.source = 'internal';
+                            changeEvt.timestamp = Date.now();
+                            if (this._canEmit()) await this._emitSequential('change', changeEvt);
                         }
 
                         for (const r of pending.resolvers) r();
@@ -484,19 +602,13 @@ class GentleDB {
             // Prefer fs.watch, fallback to fs.watchFile
             try {
                 this._watcher = fs.watch(this._filePath, { persistent: true }, (evt, filename) => {
-                    // fs.watch sometimes returns event type 'rename' when file is deleted/moved — robust handling below
                     if (evt === 'rename') {
-                        // check if file still exists
-                        fsp.stat(this._filePath).then(() => onFSChange('rename', filename)).catch(() => {
-                            // file missing; trigger change handling which will read the file (and fail gracefully)
-                            onFSChange('rename', filename);
-                        });
+                        fsp.stat(this._filePath).then(() => onFSChange('rename', filename)).catch(() => onFSChange('rename', filename));
                     } else {
                         onFSChange(evt, filename);
                     }
                 });
                 this._watcher.on('error', (err) => {
-                    // fallback to watchFile
                     try { fs.unwatchFile(this._filePath); } catch (e) { /* ignore */ }
                     this._watcher = null;
                     this._usingWatchFile = true;
@@ -523,6 +635,19 @@ class GentleDB {
 
         try {
             const oldRuntime = GentleDB._cloneSafe(this._low && this._low.data !== undefined ? this._low.data : {});
+
+            // Emit pre-read 'read' event (cancellable)
+            if (this._canEmit()) {
+                const preRead = this._makeEvent('read', 'read', oldRuntime, GentleDB._cloneSafe(oldRuntime));
+                await this._emitSequential('read', preRead);
+                const legacyBefore = this._makeEvent('beforeread', 'read', oldRuntime, GentleDB._cloneSafe(oldRuntime));
+                await this._emitSequential('beforeread', legacyBefore);
+                if (preRead.defaultPrevented || legacyBefore._prevented) {
+                    // aborted by listener — do not apply external change
+                    return;
+                }
+            }
+
             await this._low.read();
             const diskSnapshot = GentleDB._cloneSafe(this._low.data === undefined ? {} : this._low.data);
 
@@ -534,18 +659,23 @@ class GentleDB {
             this._low.data = GentleDB._cloneSafe(diskSnapshot);
             this._lastOnDiskSnapshot = GentleDB._cloneSafe(diskSnapshot);
 
-            const readEvt = this._makeEvent('read', oldRuntime, GentleDB._cloneSafe(diskSnapshot));
-            await this._emitSequential('read', readEvt);
-            const afterReadEvt = this._makeEvent('afterread', oldRuntime, GentleDB._cloneSafe(diskSnapshot));
-            await this._emitSequential('afterread', afterReadEvt);
+            // legacy afterread
+            if (this._canEmit()) {
+                const afterReadEvt = this._makeEvent('afterread', 'read', oldRuntime, GentleDB._cloneSafe(diskSnapshot));
+                await this._emitSequential('afterread', afterReadEvt);
+            }
 
+            // compute and emit unified change
             const changes = this._computeTopLevelChanges(oldRuntime, diskSnapshot);
             if (Object.keys(changes).length > 0) {
-                const changeEvt = this._makeEvent('change', oldRuntime, GentleDB._cloneSafe(diskSnapshot));
+                const changeEvt = this._makeEvent('change', 'external', oldRuntime, GentleDB._cloneSafe(diskSnapshot));
                 changeEvt.changes = changes;
-                await this._emitSequential('change', changeEvt);
+                changeEvt.source = 'external';
+                changeEvt.timestamp = Date.now();
+                if (this._canEmit()) await this._emitSequential('change', changeEvt);
             }
         } catch (err) {
+            // emit watcher error via legacy channel
             this._ee.emit('watcher:error', { type: 'watcher:read-error', error: err });
         }
     }
@@ -568,8 +698,8 @@ class GentleDB {
                 try {
                     if (typeof handle.datasync === 'function') {
                         await handle.datasync();
-                    } else if (typeof handle.sync === 'function') {
-                        await handle.sync();
+                    } else if (typeof handle.fd === 'number') {
+                        try { await fsp.fsync(handle.fd); } catch (e) { /* ignore */ }
                     }
                 } catch (e) {
                     // ignore - best-effort
@@ -637,12 +767,29 @@ class GentleDB {
         } catch (e) { /* ignore */ }
     }
 
-    _makeEvent(type, oldData, newData) {
-        const evt = { type, oldData: GentleDB._cloneSafe(oldData), newData: GentleDB._cloneSafe(newData), _prevented: false, _result: undefined };
+    _makeEvent(type, op = '', oldData = undefined, newData = undefined) {
+        const evt = {
+            type,
+            op: op || '',
+            timestamp: Date.now(),
+            oldData: GentleDB._cloneSafe(oldData),
+            newData: GentleDB._cloneSafe(newData),
+            defaultPrevented: false,
+            chainPrevented: false,
+            _result: undefined
+        };
 
-        evt.preventDefault = () => { evt._prevented = true; };
-        evt.setResult = (v) => { evt._result = v; evt._prevented = true; };
+        // preventDefault: only meaningful for cancellable events (all except 'change' and 'error')
+        evt.preventDefault = () => {
+            if (type === 'change' || type === 'error') return;
+            evt.defaultPrevented = true;
+        };
+        // preventChain: suppress nested emissions from inside listeners
+        evt.preventChain = () => { evt.chainPrevented = true; };
+        // setResult - set return result and mark defaultPrevented (except for change/error)
+        evt.setResult = (v) => { evt._result = v; if (type !== 'change' && type !== 'error') evt.defaultPrevented = true; };
 
+        // convenience helpers for mutating newData
         evt.get = (pth) => this._getAtPath(evt.newData, pth);
         evt.set = (pth, value) => { this._setAtPath(evt.newData, pth, value); return evt; };
         evt.merge = (pth, obj) => { const cur = this._getAtPath(evt.newData, pth) || {}; this._setAtPath(evt.newData, pth, this._deepMerge(GentleDB._cloneSafe(cur), obj)); return evt; };
@@ -678,7 +825,6 @@ class GentleDB {
         if (typeof a !== typeof b) return false;
         if (typeof a !== 'object') return a === b;
 
-        // arrays
         if (Array.isArray(a) || Array.isArray(b)) {
             if (!Array.isArray(a) || !Array.isArray(b)) return false;
             if (a.length !== b.length) return false;
@@ -700,13 +846,10 @@ class GentleDB {
     }
 
     _deepMerge(a, b) {
-        // defensive: if b undefined return a
         if (b === undefined) return a;
-        // if a missing/primitive, clone b
         if (a === undefined || a === null) return GentleDB._cloneSafe(b);
         if (typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) || Array.isArray(b)) return GentleDB._cloneSafe(b);
 
-        // mutate a intentionally for speed, but avoid prototype-pollution keys
         for (const k of Object.keys(b)) {
             if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
             const bv = b[k];
@@ -726,9 +869,8 @@ class GentleDB {
         let cur = root;
         for (const part of parts) {
             if (cur === undefined || cur === null) return undefined;
-            // avoid accessing inherited properties unexpectedly
             if (!Object.prototype.hasOwnProperty.call(cur, part) && typeof cur !== 'function') {
-                // accessing cur[part] on primitives returns undefined; we already guard above
+                // harmless: will return undefined if doesn't exist
             }
             cur = cur[part];
         }
@@ -752,15 +894,12 @@ class GentleDB {
         for (let i = 0; i < parts.length - 1; i++) {
             const p = parts[i];
             const nextPart = parts[i + 1];
-
-            // micro-opt: simple numeric check (avoid regex every time)
             const np = nextPart;
             const nextIsIndex = (typeof np === 'string' && np.length > 0 && /^[0-9]+$/.test(np));
 
             if (cur[p] === undefined || cur[p] === null) cur[p] = nextIsIndex ? [] : {};
             cur = cur[p];
 
-            // if cur ended up being primitive, replace with empty object
             if (cur === null || (typeof cur !== 'object' && !Array.isArray(cur))) {
                 cur = cur[parts[i]] = {};
             }
@@ -778,7 +917,6 @@ class GentleDB {
         let parent = root;
         for (let i = 0; i < parts.length - 1; i++) {
             const key = parts[i];
-
             if (parent == null || parent[key] === undefined) return;
             parent = parent[key];
             if (parent == null || (typeof parent !== 'object' && !Array.isArray(parent))) return;
