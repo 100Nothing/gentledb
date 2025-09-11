@@ -29,14 +29,20 @@ async function run() {
         // event test: listen for canonical 'write' and 'change'
         let writeFired = false;
         let changeFired = false;
-        const unsubWrite = db.on('write', (evt) => {
+
+        // store handlers so we can call off(...) later
+        const writeHandler = (evt) => {
             writeFired = true;
             assert.ok(evt && typeof evt.newData === 'object', 'write event shape wrong');
-        });
-        const unsubChange = db.on('change', (evt) => {
+        };
+        const changeHandler = (evt) => {
             changeFired = true;
             assert.ok(evt && typeof evt.changes === 'object', 'change event shape wrong');
-        });
+        };
+
+        // on() no longer returns an unsubscribe function in v1.0.3
+        db.on('write', writeHandler);
+        db.on('change', changeHandler);
 
         // write (merge semantics)
         await db.write({ users: [{ id: 'u1', name: 'Ada' }] });
@@ -50,11 +56,18 @@ async function run() {
         assert.strictEqual(writeFired, true, 'write should have fired');
         assert.strictEqual(changeFired, true, 'change should have fired');
 
-        // replace semantics
-        await db.write({ users: [] }, { replace: true });
+        // replace semantics — use the new replace() API in v1.0.3
+        writeFired = false;
+        changeFired = false;
+        await db.replace({ users: [] });
         await new Promise((r) => setTimeout(r, 120));
         const data2 = await db.getAll();
         assert.strictEqual(data2.users.length, 0, 'replace did not clear users');
+
+        // note: replace() still emits write compatibility events for migration,
+        // so the write handler should still observe the operation (legacy compatibility).
+        assert.strictEqual(writeFired, true, 'write compatibility event should have fired during replace');
+        assert.strictEqual(changeFired, true, 'change should have fired for replace');
 
         // findMatches
         await db.write({ items: [{ id: 1, title: 'Hello World' }, { id: 2, title: 'Another' }] });
@@ -62,9 +75,9 @@ async function run() {
         const res = await db.findMatches('hello');
         assert.ok(Array.isArray(res.partial) && (res.partial.length + res.exact.length) >= 1, 'findMatches did not find expected entries');
 
-        // cleanup
-        unsubWrite();
-        unsubChange();
+        // cleanup: explicitly remove handlers using off(name, fn)
+        db.off('write', writeHandler);
+        db.off('change', changeHandler);
         await db.close();
 
         // remove test DB file

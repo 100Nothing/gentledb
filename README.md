@@ -1,4 +1,4 @@
-[Changelog for current: 1.0.2](https://github.com/100Nothing/gentledb/releases/tag/v1.0.2)
+[Changelog for current: 1.0.3](https://github.com/100Nothing/gentledb/releases/tag/v1.0.3)
 
 # GentleDB
 
@@ -10,26 +10,28 @@ Run:
 `npm install gentledb`
 
 Or when developing locally:
-`npm install /path/to/local/gentledb-1.0.0.tgz`
+`npm install /path/to/local/gentledb-1.0.3.tgz`
 
 ## Quickstart
 
-Small example usage:
+Small example usage (CommonJS):
 
 ```js
-// CommonJS
 const GentleDB = require('gentledb');
+const path = require('path');
 
 (async () => {
-  const db = new GentleDB('./data.json', { defaultData: { users: [] } });
+  const db = new GentleDB(path.join(__dirname, 'data.json'), { defaultData: { users: [] } });
   await db.read();
 
-  // Merge-style write (default)
+  // Merge-style partial write (default)
   await db.write({ users: [{ id: 'a', name: 'Ada' }] });
 
-  // Replace entire DB root (requests a replace op; replace is handled as a write with op='replace'
-  // and a dedicated replace event/method is planned for 1.1.0)
-  // await db.write({ users: [] }, { replace: true });
+  // Replace entire DB root (canonical API in v1.0.3)
+  await db.replace({ users: [] });
+
+  // Reset DB to configured defaultData
+  await db.resetDefault();
 
   const data = await db.getAll();
   console.log(data);
@@ -38,7 +40,7 @@ const GentleDB = require('gentledb');
 })();
 ```
 
-This example will create a `data.json` file in the current directory, write `{ users: [{ id: 'a', name: 'Ada' }] }` to it, get all data and log it.
+This example will create a `data.json` file in the current directory, merge a `users` array, then demonstrate replace/reset flows, read all data and log it.
 
 ## API (summary)
 
@@ -52,13 +54,21 @@ This example will create a `data.json` file in the current directory, write `{ u
 
   * **Returns** a deep-cloned snapshot of the data (debounced).
 
-* `write(partialOrFullData?, { replace?: boolean }) → Promise<any>`
+* `write(partialOrFullData?) → Promise<any>`
 
-  * **By default** `write(partial)` merges top-level keys.
+  * **By default** `write(partial)` merges top-level keys (partial merge semantics).
 
-  * Use **{ replace: true }** to replace the entire root. Note: in v1.0.2 replace is expressed via `evt.op === 'replace'` on the `write` event; a distinct `replace` event/method will be added in 1.1.0.
+  * **Important (v1.0.3):** `write()` is now strictly a partial-write method and **no longer accepts** an options argument. Use `replace()` to replace the entire root instead.
 
   * Listeners can cancel a write by calling `evt.preventDefault()` or `evt.setResult(value)`. If they mutate `evt.newData`, those mutations will be honored before persistence.
+
+* `replace(fullData) → Promise<any>`
+
+  * Replaces the entire DB root. Emits the canonical `replace` event. For backward compatibility, runtime also emits `write` compatibility events so existing listeners continue working until 1.1.0.
+
+* `resetDefault() → Promise<any>`
+
+  * Replaces DB contents with the configured `defaultData`. Emits the canonical `replace` event with `evt.op === 'resetDefault'`.
 
 * `getAll() → Promise<any>`
 
@@ -68,18 +78,21 @@ This example will create a `data.json` file in the current directory, write `{ u
 
   * Search leaf values; query accepts **string**, **RegExp**, or **array**.
 
-* `on(eventName, handler) → () => void (unsubscribe)`
+* `on(eventName, handler) → void` (v1.0.3)
 
-  * **Canonical supported events (v1.0.2):**
+  * **Note (v1.0.3):** `on()` no longer returns an unsubscribe function. Call `off(name, fn)` to remove listeners.
 
-    * `write` (pre-operation — cancellable; `evt.op` indicates 'write' or 'replace' intent)
+  * **Canonical supported events (v1.0.3):**
+
+    * `write` (pre-operation — cancellable; `evt.op` indicates 'write', 'replace' or 'resetDefault' intent)
+    * `replace` (pre/post — cancellable; canonical full-replace event)
     * `read` (pre-operation — cancellable)
     * `lock` (pre-operation — cancellable)
     * `unlock` (pre-operation — cancellable)
     * `change` (post-operation — not cancellable; includes `source: 'internal'|'external'` and `changes`)
     * `error` (emitted for non-throwing errors; not cancellable)
 
-  * **Legacy compatibility events (still emitted in 1.0.2; deprecated for 1.1.0):**
+  * **Legacy compatibility events (still emitted in 1.0.3; deprecated for 1.1.0):**
 
     * `beforeread`, `beforewrite`, `afterread`, `afterwrite`
     * `watcher:error` (watcher error channel)
@@ -122,7 +135,7 @@ If you use TypeScript, `src/index.d.ts` ships type declarations. The package is 
 
 ```ts
 import GentleDB from 'gentledb';
-const db = new GentleDB<{ users: { id: string; name: string }[] }>('./data.json');
+const db = new GentleDB<{ users: { id: string; name: string }[] }>("./data.json");
 ```
 
 ## Examples
@@ -131,7 +144,7 @@ See `src/examples/` (*basic usage*, *events*, *findMatches*).
 
 ### Notes about events & migration
 
-* v1.0.2 introduces the canonical event shape and canonical names. Legacy `before*`/`after*` events are still emitted for compatibility but will be removed in 1.1.0 — migrate listeners to `write`, `read`, `lock`, `unlock`, `change`, `error` soon.
+* v1.0.3 introduces a canonical `replace` event/method and makes `write()` a partial-only method. Runtime emits legacy `before*`/`after*` compatibility events for now, but those will be removed in 1.1.0 — migrate listeners to `write`, `replace`, `read`, `lock`, `unlock`, `change`, `error` as appropriate.
 * Use `evt.setResult()` if you need the listener to cancel and return a specific value; use `evt.preventDefault()` if you only want to cancel.
 * Use `evt.preventChain()` inside listeners when you want to prevent nested event emissions from code invoked inside the listener.
 

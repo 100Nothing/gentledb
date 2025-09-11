@@ -163,7 +163,7 @@ class GentleDB {
             } catch (e) { /* ignore */ }
         }
         this._ee.on(name, fn);
-        return () => { try { this._ee.off(name, fn); } catch (e) { /* ignore */ } };
+        // intentionally do not return an unsubscribe function - rely on off(name, fn)
     }
 
     off(name, fn) {
@@ -175,11 +175,23 @@ class GentleDB {
         return this._debouncedRead();
     }
 
-    async write(partialOrFullData = undefined, opts = {}) {
+    // write() is now strictly a partial write method and does not accept an options argument.
+    async write(partialOrFullData = undefined) {
         await this._initPromise;
-        const useReplace = Boolean(opts.replace);
-        // op will be 'replace' inside evt.op when replace requested, but event.type remains 'write' (no replace event yet)
-        return this._debouncedWrite(partialOrFullData, { replace: useReplace });
+        return this._debouncedWrite(partialOrFullData, {});
+    }
+
+    // replace: full-replace write (emits 'replace' event; for compatibility also emits 'write' events)
+    async replace(fullData) {
+        await this._initPromise;
+        return this._debouncedWrite(fullData, { replace: true, op: 'replace' });
+    }
+
+    // resetDefault: replace DB contents with configured defaultData (op: 'resetDefault')
+    async resetDefault() {
+        await this._initPromise;
+        const def = GentleDB._cloneSafe(this.opts.defaultData === undefined ? {} : this.opts.defaultData);
+        return this._debouncedWrite(def, { replace: true, op: 'resetDefault' });
     }
 
     async getAll() {
@@ -503,32 +515,43 @@ class GentleDB {
                             else proposed = this._deepMerge(GentleDB._cloneSafe(oldData), pending.data);
                         }
 
-                        // op name (for evt.op) — 'replace' may be requested but no replace event type exists yet
-                        const opName = (pending.opts && pending.opts.replace) ? 'replace' : 'write';
-                        const eventType = 'write'; // canonical event type (replace as separate type reserved for 1.1.0)
+                        // op name (for evt.op) - can be 'replace', 'resetDefault' or 'write'
+                        const opName = (pending.opts && pending.opts.op) ? String(pending.opts.op) : ((pending.opts && pending.opts.replace) ? 'replace' : 'write');
+                        // canonical event type: replace vs write
+                        const primaryEventType = (pending.opts && pending.opts.replace) ? 'replace' : 'write';
 
                         // pre-write emission
-                        let writeEvt, legacyBefore;
+                        let primaryEvt, legacyBefore, legacyWritePre;
                         if (this._canEmit()) {
-                            writeEvt = this._makeEvent(eventType, opName, oldData, GentleDB._cloneSafe(proposed));
-                            await this._emitSequential(eventType, writeEvt);
+                            // canonical primary event ('write' or 'replace')
+                            primaryEvt = this._makeEvent(primaryEventType, opName, oldData, GentleDB._cloneSafe(proposed));
+                            await this._emitSequential(primaryEventType, primaryEvt);
 
+                            // legacy beforewrite
                             legacyBefore = this._makeEvent('beforewrite', opName, oldData, GentleDB._cloneSafe(proposed));
                             await this._emitSequential('beforewrite', legacyBefore);
 
+                            // For compatibility: if this is a replace operation, also emit 'write' pre-event
+                            if (primaryEventType !== 'write') {
+                                legacyWritePre = this._makeEvent('write', opName, oldData, GentleDB._cloneSafe(primaryEvt && primaryEvt.newData !== undefined ? primaryEvt.newData : proposed));
+                                await this._emitSequential('write', legacyWritePre);
+                            }
+
                             // If prevented by either canonical or legacy, respect result and skip actual write
-                            if (writeEvt.defaultPrevented || legacyBefore._prevented) {
-                                const chosen = (typeof writeEvt._result !== 'undefined') ? writeEvt._result : legacyBefore._result;
+                            if (primaryEvt.defaultPrevented || (legacyBefore && legacyBefore._prevented) || (legacyWritePre && legacyWritePre.defaultPrevented)) {
+                                const chosen = (typeof primaryEvt._result !== 'undefined') ? primaryEvt._result : (legacyWritePre && typeof legacyWritePre._result !== 'undefined') ? legacyWritePre._result : legacyBefore._result;
                                 // emit legacy afterwrite for compatibility
-                                const afterCompat = this._makeEvent('afterwrite', opName, oldData, GentleDB._cloneSafe(writeEvt && writeEvt.newData !== undefined ? writeEvt.newData : legacyBefore.newData));
+                                const afterCompat = this._makeEvent('afterwrite', opName, oldData, GentleDB._cloneSafe(primaryEvt && primaryEvt.newData !== undefined ? primaryEvt.newData : (legacyWritePre && legacyWritePre.newData !== undefined ? legacyWritePre.newData : legacyBefore.newData)));
                                 if (this._canEmit()) await this._emitSequential('afterwrite', afterCompat);
                                 for (const r of pending.resolvers) r(chosen);
                                 return;
                             }
 
-                            // Prefer writeEvt.newData if listener mutated it; else fallback to legacyBefore.newData, else proposed
-                            if (writeEvt && typeof writeEvt.newData !== 'undefined') {
-                                proposed = GentleDB._cloneSafe(writeEvt.newData);
+                            // Prefer primaryEvt.newData if listener mutated it; else fallback to legacyWritePre.newData, else legacyBefore.newData, else proposed
+                            if (primaryEvt && typeof primaryEvt.newData !== 'undefined') {
+                                proposed = GentleDB._cloneSafe(primaryEvt.newData);
+                            } else if (legacyWritePre && typeof legacyWritePre.newData !== 'undefined') {
+                                proposed = GentleDB._cloneSafe(legacyWritePre.newData);
                             } else if (legacyBefore && typeof legacyBefore.newData !== 'undefined') {
                                 proposed = GentleDB._cloneSafe(legacyBefore.newData);
                             } else {
@@ -555,10 +578,21 @@ class GentleDB {
                             try { await this._releaseLock(); } catch (e) { /* ignore */ }
                         }
 
-                        // legacy afterwrite
+                        // Post-write emissions
                         if (this._canEmit()) {
-                            const afterEvt = this._makeEvent('afterwrite', opName, oldData, GentleDB._cloneSafe(finalData));
-                            await this._emitSequential('afterwrite', afterEvt);
+                            // emit canonical after-event (replace OR write)
+                            const afterPrimary = this._makeEvent(primaryEventType, opName, oldData, GentleDB._cloneSafe(finalData));
+                            await this._emitSequential(primaryEventType, afterPrimary);
+
+                            // legacy afterwrite
+                            const legacyAfter = this._makeEvent('afterwrite', opName, oldData, GentleDB._cloneSafe(finalData));
+                            await this._emitSequential('afterwrite', legacyAfter);
+
+                            // For compatibility: if this was a replace, also emit a 'write' after-event
+                            if (primaryEventType !== 'write') {
+                                const writeAfter = this._makeEvent('write', opName, oldData, GentleDB._cloneSafe(finalData));
+                                await this._emitSequential('write', writeAfter);
+                            }
                         }
 
                         // compute and emit change (non-cancellable)
@@ -643,7 +677,7 @@ class GentleDB {
                 const legacyBefore = this._makeEvent('beforeread', 'read', oldRuntime, GentleDB._cloneSafe(oldRuntime));
                 await this._emitSequential('beforeread', legacyBefore);
                 if (preRead.defaultPrevented || legacyBefore._prevented) {
-                    // aborted by listener — do not apply external change
+                    // aborted by listener - do not apply external change
                     return;
                 }
             }
