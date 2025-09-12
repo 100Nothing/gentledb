@@ -1,4 +1,4 @@
-[Changelog for current: 1.0.3](https://github.com/100Nothing/gentledb/releases/tag/v1.0.3)
+[Changelog for current: 1.0.31](https://github.com/100Nothing/gentledb/releases/tag/v1.0.31)
 
 # GentleDB
 

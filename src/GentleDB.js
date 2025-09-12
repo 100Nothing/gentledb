@@ -531,7 +531,7 @@ class GentleDB {
                             legacyBefore = this._makeEvent('beforewrite', opName, oldData, GentleDB._cloneSafe(proposed));
                             await this._emitSequential('beforewrite', legacyBefore);
 
-                            // For compatibility: if this is a replace operation, also emit 'write' pre-event
+                            // For compatibility: if this is a replace operation, also emit a `write` *pre*-event (single emission)
                             if (primaryEventType !== 'write') {
                                 legacyWritePre = this._makeEvent('write', opName, oldData, GentleDB._cloneSafe(primaryEvt && primaryEvt.newData !== undefined ? primaryEvt.newData : proposed));
                                 await this._emitSequential('write', legacyWritePre);
@@ -580,19 +580,9 @@ class GentleDB {
 
                         // Post-write emissions
                         if (this._canEmit()) {
-                            // emit canonical after-event (replace OR write)
-                            const afterPrimary = this._makeEvent(primaryEventType, opName, oldData, GentleDB._cloneSafe(finalData));
-                            await this._emitSequential(primaryEventType, afterPrimary);
-
-                            // legacy afterwrite
+                            // emit legacy afterwrite only - canonical events were emitted as pre-events above
                             const legacyAfter = this._makeEvent('afterwrite', opName, oldData, GentleDB._cloneSafe(finalData));
                             await this._emitSequential('afterwrite', legacyAfter);
-
-                            // For compatibility: if this was a replace, also emit a 'write' after-event
-                            if (primaryEventType !== 'write') {
-                                const writeAfter = this._makeEvent('write', opName, oldData, GentleDB._cloneSafe(finalData));
-                                await this._emitSequential('write', writeAfter);
-                            }
                         }
 
                         // compute and emit change (non-cancellable)
@@ -979,7 +969,7 @@ class GentleDB {
         if (query instanceof RegExp) return [this._normalizeTokenObject({ token: query })];
         if (typeof query === 'string') {
             const out = [];
-            const re = /"([^"]+)"|'([^']+)'|\/([^/]+)\/([gimsuy]*)|=([^\s,]+)|([^\s,]+)/g;
+            const re = /"([^\"]+)"|'([^']+)'|\/([^/]+)\/([gimsuy]*)|=([^\s,]+)|([^\s,]+)/g;
             let m;
             while ((m = re.exec(query)) !== null) {
                 if (m[1]) out.push({ token: m[1], exactOnly: false });
